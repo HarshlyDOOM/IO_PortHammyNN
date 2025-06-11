@@ -7,6 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PLNet import PLNet, BiLipNet # Make sure PLNet.py is in PYTHONPATH or same directory
 from LyaProj import stable_dyn     # Make sure LyaProj.py is in PYTHONPATH or same directory
+from torch.func import vmap, grad
+from torchdiffeq import odeint
 
 # ----------------------------------------
 # Encoder (shared)
@@ -70,9 +72,12 @@ class AE_SHND_Core(nn.Module):
         original_grad_state = torch.is_grad_enabled()
         try:
             if not original_grad_state: torch.set_grad_enabled(True)
-            z_for_H = self._prepare_tensor_for_grad(z)
-            H_val = self.H_module(z_for_H)
-            gH = torch.autograd.grad(H_val.sum(), z_for_H, create_graph=True, retain_graph=True)[0]
+            z_for_H = z.detach().requires_grad_(True)
+
+            def hamiltonian_scalar(z_single):
+                return self.H_module(z_single.unsqueeze(0)).squeeze()
+
+            gH = vmap(grad(hamiltonian_scalar))(z_for_H)
         finally:
             if not original_grad_state: torch.set_grad_enabled(False)
         
@@ -87,7 +92,6 @@ class AE_SHND_Core(nn.Module):
 
         dz = torch.bmm(J - R, gH.unsqueeze(-1)).squeeze(-1) - self.eps * gH
         return dz # Only returns dz
-
 # ----------------------------------------
 # pH_SHND_Core: Port-Hamiltonian Dynamics Core
 # ----------------------------------------
@@ -97,6 +101,8 @@ class pH_SHND_Core(nn.Module):
         self.latent_dim = latent_dim
         self.control_input_dim = control_input_dim
         self.eps = eps
+        self._u = None  # Buffer for control input for odeint
+
         net = BiLipNet(self.latent_dim, bln_units, mu, nu)
         self.H_module = PLNet(net, use_bias=False) 
         self.JR_net = nn.Sequential( 
@@ -104,65 +110,38 @@ class pH_SHND_Core(nn.Module):
             nn.Linear(64, 64), nn.Tanh(),
             nn.Linear(64, 2 * (self.latent_dim ** 2))
         )
-        # self.J_net = nn.Sequential(
-        #     nn.Linear(latent_dim, 64), nn.Tanh(),
-        #     nn.Linear(64, 64), nn.Tanh(),
-        #     nn.Linear(64, latent_dim ** 2)
-        # )
-
-        # self.R_net = nn.Sequential(
-        #     nn.Linear(latent_dim, 64), nn.Tanh(),
-        #     nn.Linear(64, 64), nn.Tanh(),
-        #     nn.Linear(64, latent_dim ** 2)
-        # )        
-        self.Bnet = nn.Sequential(  #The Bu and B^T term in port-Hamiltonian form
+        self.Bnet = nn.Sequential(
             nn.Linear(self.latent_dim, 64), nn.Tanh(),
             nn.Linear(64, 64), nn.Tanh(),
             nn.Linear(64, self.latent_dim * self.control_input_dim)
         )
 
-    def _prepare_tensor_for_grad(self, t):
-        if not t.requires_grad: return t.requires_grad_(True)
-        elif t.grad_fn is not None: return t.clone().detach().requires_grad_(True)
-        return t
-
-    def compute_dz_and_output(self, z, u_current_physical):  #Computing z_dot and y for Port-Hamiltonian
+    def compute_dz_and_output(self, z, u):
         batch_size, _ = z.shape
-        gH = None
-        original_grad_state = torch.is_grad_enabled()
-        try:
-            if not original_grad_state: torch.set_grad_enabled(True)
-            z_for_H = self._prepare_tensor_for_grad(z)
-            H_val = self.H_module(z_for_H)
-            gH = torch.autograd.grad(H_val.sum(), z_for_H, create_graph=True, retain_graph=True)[0]
-        finally:
-            if not original_grad_state: torch.set_grad_enabled(False)
-        if gH is None: raise RuntimeError("gH was not computed.")
+
+        with torch.enable_grad():
+            z_for_H = z.detach().requires_grad_(True)
+
+            def hamiltonian_scalar(z_single):
+                return self.H_module(z_single.unsqueeze(0)).squeeze()
+
+            gH = vmap(grad(hamiltonian_scalar))(z_for_H)
 
         JR_out = self.JR_net(z)
-        J_flat = JR_out[:, :self.latent_dim ** 2]
-        R_factor_flat = JR_out[:, self.latent_dim ** 2:]
-        J = J_flat.view(batch_size, self.latent_dim, self.latent_dim)
+        J = JR_out[:, :self.latent_dim**2].view(batch_size, self.latent_dim, self.latent_dim)
+        Rf = JR_out[:, self.latent_dim**2:].view(batch_size, self.latent_dim, self.latent_dim)
+
         J = J - J.transpose(1, 2)
-        R_factor = R_factor_flat.view(batch_size, self.latent_dim, self.latent_dim)
-        R = R_factor @ R_factor.transpose(1, 2)
+        R = Rf @ Rf.transpose(1, 2)
 
-        # J_flat = self.J_net(z)
-        # R_factor_flat = self.R_net(z)
-        # J = J_flat.view(batch_size, self.latent_dim, self.latent_dim)
-        # J = J - J.transpose(1, 2)
-        # R_factor = R_factor_flat.view(batch_size, self.latent_dim, self.latent_dim)
-        # R = R_factor @ R_factor.transpose(1, 2)
+        B = self.Bnet(z).view(batch_size, self.latent_dim, self.control_input_dim)
+        Bu = torch.bmm(B, u.unsqueeze(-1)).squeeze(-1)
 
-        B_elements = self.Bnet(z)
-        B = B_elements.view(batch_size, self.latent_dim, self.control_input_dim)
-        Bu = torch.bmm(B, u_current_physical.unsqueeze(-1)).squeeze(-1)
-        term_J_R_gH = torch.bmm(J - R, gH.unsqueeze(-1)).squeeze(-1)
-        dz = term_J_R_gH + Bu - self.eps * gH
-        y_pred = torch.bmm(B.transpose(1, 2), gH.unsqueeze(-1)).squeeze(-1)
-        return dz, y_pred
+        dz = torch.bmm(J - R, gH.unsqueeze(-1)).squeeze(-1) + Bu - self.eps * gH
+        y = torch.bmm(B.transpose(1, 2), gH.unsqueeze(-1)).squeeze(-1)
+        return dz, y
 
-    def forward(self, z, u_current_physical, dt=1.0):
+    def forward(self, z, u_current_physical, dt=0.025):
         dz1, _ = self.compute_dz_and_output(z, u_current_physical)
         z1_intermediate = z + dt * dz1
         dz2, y_pred = self.compute_dz_and_output(z1_intermediate, u_current_physical)
@@ -180,8 +159,6 @@ class LatentLyaProj(nn.Module):
     def forward(self, z, u=None, dt=None): 
         dz = self.dyn_module(z) 
         return z + dt * dz, None
-
-
 # ----------------------------------------
 # Unified Latent IO Model
 # ----------------------------------------

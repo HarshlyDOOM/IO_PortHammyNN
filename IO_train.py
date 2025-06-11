@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset, Subset
 from IO_SHND import LatentIOModel # Assuming IO_SHND.py is in the same directory or PYTHONPATH
+from torchdiffeq import odeint
 
 def build_io_window_dataset(theta, u, window_size=2): # na=nb=window_size
     X_list, Y_list = [], []
@@ -91,26 +92,25 @@ def simulate_io_model(model, u_signal, theta_signal, window_size=2, skip_initial
         y_true_for_sim_list = y_true_for_sim_list[:min_len]
     return np.array(y_preds_list), np.array(y_true_for_sim_list)
 
-
 def compute_metrics(y_true, y_pred):
     # --- ADDED DEBUG PRINTS ---
-    # print("\n--- Inside compute_metrics ---")
-    # print(f"Type of y_true: {type(y_true)}, Shape: {y_true.shape if isinstance(y_true, np.ndarray) else 'Not an ndarray'}")
-    # print(f"Type of y_pred: {type(y_pred)}, Shape: {y_pred.shape if isinstance(y_pred, np.ndarray) else 'Not an ndarray'}")
-    # if isinstance(y_true, np.ndarray) and len(y_true) > 0:
-    #     print("y_true (first 5):", y_true[:5])
-    # if isinstance(y_pred, np.ndarray) and len(y_pred) > 0:
-    #     print("y_pred (first 5):", y_pred[:5])
+    print("\n--- Inside compute_metrics ---")
+    print(f"Type of y_true: {type(y_true)}, Shape: {y_true.shape if isinstance(y_true, np.ndarray) else 'Not an ndarray'}")
+    print(f"Type of y_pred: {type(y_pred)}, Shape: {y_pred.shape if isinstance(y_pred, np.ndarray) else 'Not an ndarray'}")
+    if isinstance(y_true, np.ndarray) and len(y_true) > 0:
+        print("y_true (first 5):", y_true[:5])
+    if isinstance(y_pred, np.ndarray) and len(y_pred) > 0:
+        print("y_pred (first 5):", y_pred[:5])
 
-    # if len(y_true) == 0 or len(y_pred) == 0:
-    #     print("Warning: compute_metrics received empty array(s).")
-    #     return np.nan, np.nan, np.nan
+    if len(y_true) == 0 or len(y_pred) == 0:
+        print("Warning: compute_metrics received empty array(s).")
+        return np.nan, np.nan, np.nan
     
-    # if np.allclose(y_true, y_pred):
-    #     print("WARNING in compute_metrics: y_true and y_pred are identical or very close!")
-    #     # This would correctly lead to RMSE near 0.
-    # else:
-    #     print("Note in compute_metrics: y_true and y_pred appear different.")
+    if np.allclose(y_true, y_pred):
+        print("WARNING in compute_metrics: y_true and y_pred are identical or very close!")
+        # This would correctly lead to RMSE near 0.
+    else:
+        print("Note in compute_metrics: y_true and y_pred appear different.")
     # --- END ADDED DEBUG PRINTS ---
 
     err = y_pred - y_true
@@ -155,25 +155,6 @@ def train_and_evaluate(model_label="pH_SHND", proj_fn="ICNN", device_str='cpu'):
     n_val = int(val_split_ratio * N_total_samples)
     n_test = N_total_samples - n_train - n_val
 
-    ## Input Normalization for Training
-    
-    # X_all, Y_all = full_dataset.tensors[0], full_dataset.tensors[1]
-
-    # X_train = X_all[:n_train]
-    # X_val = X_all[n_train:n_train+n_val]
-    # X_test = X_all[n_train+n_val:]
-    # Y_train = Y_all[:n_train]
-    # Y_val = Y_all[n_train:n_train+n_val]
-    # Y_test = Y_all[n_train+n_val:]
-
-    # # --- Normalize inputs (X) based on training data stats ---
-    # x_mean = X_train.mean(dim=0, keepdim=True)
-    # x_std = X_train.std(dim=0, keepdim=True) + 1e-8  # avoid division by zero
-
-    # X_train = (X_train - x_mean) / x_std
-    # X_val = (X_val - x_mean) / x_std
-    # X_test = (X_test - x_mean) / x_std
-
     if n_test <= 0:
         print("Warning: Test set size is zero or negative. Adjusting validation split.")
         n_val = max(0, N_total_samples - n_train - 1) 
@@ -202,7 +183,7 @@ def train_and_evaluate(model_label="pH_SHND", proj_fn="ICNN", device_str='cpu'):
     latent_dim_shared = 8
     encoder_hidden_dim_shared = 64
     shnd_bln_units_config = [32, 32] 
-    dt_simulation_step = 1.0 
+    dt_simulation_step = 0.025 
     actual_physical_control_input_dim = 1
 
     args_for_lyaproj_config = Dict2Class({
@@ -228,20 +209,6 @@ def train_and_evaluate(model_label="pH_SHND", proj_fn="ICNN", device_str='cpu'):
 
     # --- Training Loop ---
     num_epochs = 300 
-
-    # # Separate params with and without weight decay (Weight Decay on R(x) of Port-Hamiltonian Model)
-
-    # if hasattr(model.latent_dynamics_core, "R_net"):
-    #     decay_params = list(model.latent_dynamics_core.R_net.parameters())
-    #     no_decay_params = [p for n, p in model.named_parameters() if not any(p is d for d in decay_params)]
-    #     optimizer = torch.optim.Adam([
-    #         {'params': decay_params, 'weight_decay': 1e-4},
-    #         {'params': no_decay_params, 'weight_decay': 0.0}
-    #     ], lr=1e-3)
-    # else:
-    #     # fallback for models without R_net (like AE_SHND)
-    #     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=0.0)          
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     # Learning Rate Scheduler, as from the original work
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs)
@@ -295,15 +262,15 @@ def train_and_evaluate(model_label="pH_SHND", proj_fn="ICNN", device_str='cpu'):
     y_true_test_np = np.concatenate(y_true_test_list)
     y_pred_test_np = np.concatenate(y_pred_test_list)
     
-    # # --- ADDED DEBUG PRINTS for one-step prediction metrics ---
-    # print("\n--- Data passed to compute_metrics for ONE-STEP PREDICTION ---")
-    # print(f"Type of y_true_test_np: {type(y_true_test_np)}, Shape: {y_true_test_np.shape}")
-    # print(f"Type of y_pred_test_np: {type(y_pred_test_np)}, Shape: {y_pred_test_np.shape}")
-    # if len(y_true_test_np) > 0: print("y_true_test_np (first 5):", y_true_test_np[:5])
-    # if len(y_pred_test_np) > 0: print("y_pred_test_np (first 5):", y_pred_test_np[:5])
-    # print("------------------------------------------------------------\n")
+    # --- ADDED DEBUG PRINTS for one-step prediction metrics ---
+    print("\n--- Data passed to compute_metrics for ONE-STEP PREDICTION ---")
+    print(f"Type of y_true_test_np: {type(y_true_test_np)}, Shape: {y_true_test_np.shape}")
+    print(f"Type of y_pred_test_np: {type(y_pred_test_np)}, Shape: {y_pred_test_np.shape}")
+    if len(y_true_test_np) > 0: print("y_true_test_np (first 5):", y_true_test_np[:5])
+    if len(y_pred_test_np) > 0: print("y_pred_test_np (first 5):", y_pred_test_np[:5])
+    print("------------------------------------------------------------\n")
     one_step_pred_metrics = compute_metrics(y_true_test_np, y_pred_test_np)
-    # # --- END ADDED DEBUG PRINTS for one-step prediction metrics ---
+    # --- END ADDED DEBUG PRINTS for one-step prediction metrics ---
 
     # --- Simulation ---
     sim_pred_np, sim_true_np = simulate_io_model(
@@ -314,14 +281,14 @@ def train_and_evaluate(model_label="pH_SHND", proj_fn="ICNN", device_str='cpu'):
         best_model_path=best_model_path
     )
     
-    # # --- ADDED DEBUG PRINTS for simulation metrics ---
-    # print("\n--- Data passed to compute_metrics for SIMULATION ---")
-    # print(f"Type of sim_true_np: {type(sim_true_np)}, Shape: {sim_true_np.shape if isinstance(sim_true_np, np.ndarray) else 'Not an ndarray'}")
-    # print(f"Type of sim_pred_np: {type(sim_pred_np)}, Shape: {sim_pred_np.shape if isinstance(sim_pred_np, np.ndarray) else 'Not an ndarray'}")
-    # if isinstance(sim_true_np, np.ndarray) and len(sim_true_np) > 0: print("sim_true_np (first 5):", sim_true_np[:5])
-    # if isinstance(sim_pred_np, np.ndarray) and len(sim_pred_np) > 0: print("sim_pred_np (first 5):", sim_pred_np[:5])
-    # print("-----------------------------------------------------\n")
-    # # ---END ADDED DEBUG PRINTS for simulation metrics ---
+    # --- ADDED DEBUG PRINTS for simulation metrics ---
+    print("\n--- Data passed to compute_metrics for SIMULATION ---")
+    print(f"Type of sim_true_np: {type(sim_true_np)}, Shape: {sim_true_np.shape if isinstance(sim_true_np, np.ndarray) else 'Not an ndarray'}")
+    print(f"Type of sim_pred_np: {type(sim_pred_np)}, Shape: {sim_pred_np.shape if isinstance(sim_pred_np, np.ndarray) else 'Not an ndarray'}")
+    if isinstance(sim_true_np, np.ndarray) and len(sim_true_np) > 0: print("sim_true_np (first 5):", sim_true_np[:5])
+    if isinstance(sim_pred_np, np.ndarray) and len(sim_pred_np) > 0: print("sim_pred_np (first 5):", sim_pred_np[:5])
+    print("-----------------------------------------------------\n")
+    # ---END ADDED DEBUG PRINTS for simulation metrics ---
     
     simulation_metrics = compute_metrics(sim_true_np, sim_pred_np)
 
@@ -370,3 +337,10 @@ if __name__ == "__main__":
             else: row_values_str.append(f"{str(val):<20}")
         print("| " + " | ".join(row_values_str) + " |")
 
+# # Final Evaluation Table
+# | Model                | Pred RMSE (rad)      | Pred RMSE (deg)      | Pred NRMSE (%)       | Sim RMSE (rad)       | Sim RMSE (deg)       | Sim NRMSE (%)        |
+# |----------------------|----------------------|----------------------|----------------------|----------------------|----------------------|----------------------|
+# | IO_pH_SHND           | 0.0039147553         | 0.2243               | 0.8351               | 0.0298               | 1.7074               | 6.8312               |
+# | IO_AE_SHND           | 0.0035518832         | 0.2035               | 0.7577               | 0.0259               | 1.4842               | 5.5261               |
+# | IO_LyaProj_ICNN      | 0.0036018721         | 0.2064               | 0.7684               | 0.0226               | 1.2960               | 4.8253               |
+# | IO_LyaProj_NN-REHU   | 0.0036301536         | 0.2080               | 0.7744               | 0.0288               | 1.6495               | 6.1416               |
